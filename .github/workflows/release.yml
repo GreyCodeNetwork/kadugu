@@ -1,8 +1,5 @@
 name: Release
 
-permissions:
-  contents: write
-
 on:
   push:
     tags:
@@ -15,7 +12,11 @@ on:
         required: true
         type: string
 
+permissions:
+  contents: write
+
 jobs:
+
   prepare-release:
     name: Prepare Release
     runs-on: ubuntu-24.04
@@ -24,6 +25,7 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
 
     steps:
+
       - name: Checkout
         uses: actions/checkout@v6
 
@@ -37,22 +39,21 @@ jobs:
             TAG="${GITHUB_REF_NAME}"
           fi
 
-          # Remove spaces
           TAG="$(echo "$TAG" | xargs)"
 
-          # Convert V1.0.0 -> v1.0.0
+          # Convert V1.0.0 to v1.0.0
           if [[ "$TAG" =~ ^V ]]; then
             TAG="v${TAG:1}"
           fi
 
-          # Validate version
-          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::Invalid version: $TAG"
-            echo "Use something like v1.0.0"
+            echo "Example: v1.0.0"
             exit 1
           fi
 
-          echo "Release tag: $TAG"
+          echo "Using release tag: $TAG"
+
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Create tag
@@ -71,13 +72,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.version.outputs.tag }}
         run: |
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG already exists"
-          else
-            gh release create "$TAG" \
-              --title "$TAG" \
-              --generate-notes
-          fi
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --generate-notes
 
 
   build:
@@ -85,32 +82,74 @@ jobs:
 
     needs: prepare-release
 
+    permissions:
+      contents: write
+
     strategy:
       fail-fast: false
 
       matrix:
         include:
 
-          # ==========================================
-          # Linux x86_64
-          # ==========================================
           - name: Linux x86_64
             target: x86_64-unknown-linux-gnu
             os: ubuntu-24.04
 
-          # ==========================================
-          # Android ARM64 - TERMUX
-          # ==========================================
           - name: Termux Android ARM64
             target: aarch64-linux-android
             os: ubuntu-24.04
 
-          # ==========================================
-          # macOS Intel
-          # ==========================================
           - name: macOS x86_64
             target: x86_64-apple-darwin
             os: macos-latest
 
-          # ==========================================
-          # mac
+          - name: macOS ARM64
+            target: aarch64-apple-darwin
+            os: macos-latest
+
+          - name: Windows x86_64
+            target: x86_64-pc-windows-msvc
+            os: windows-latest
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Android NDK
+        if: matrix.target == 'aarch64-linux-android'
+        shell: bash
+        run: |
+          yes | sudo ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager \
+            --licenses || true
+
+          ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager \
+            "ndk;27.2.12479018"
+
+      - name: Configure Android ARM64
+        if: matrix.target == 'aarch64-linux-android'
+        shell: bash
+        run: |
+          NDK="${ANDROID_HOME}/ndk/27.2.12479018"
+
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
+
+          echo "$TOOLCHAIN/bin" >> "$GITHUB_PATH"
+
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TOOLCHAIN/bin/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+
+          echo "CC_aarch64_linux_android=$TOOLCHAIN/bin/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+
+          echo "CXX_aarch64_linux_android=$TOOLCHAIN/bin/aarch64-linux-android24-clang++" >> "$GITHUB_ENV"
+
+          echo "AR_aarch64_linux_android=$TOOLCHAIN/bin/llvm-ar" >> "$GITHUB_ENV"
+
+      - name: Build and upload
+        uses: taiki-e/upload-rust-binary-action@v
