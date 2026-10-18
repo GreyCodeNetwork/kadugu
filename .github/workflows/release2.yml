@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release version (example: v1.0.0)'
+        description: 'Release version (v1, v1.0, or v1.0.0)'
         required: true
         type: string
 
@@ -16,6 +16,10 @@ permissions:
   contents: write
 
 jobs:
+
+  # ============================================================
+  # PREPARE RELEASE
+  # ============================================================
 
   prepare-release:
     name: Prepare Release
@@ -39,50 +43,91 @@ jobs:
             TAG="${GITHUB_REF_NAME}"
           fi
 
+          # Remove whitespace
           TAG="$(echo "$TAG" | xargs)"
 
-          # Convert V1.0.0 -> v1.0.0
-          if [[ "$TAG" =~ ^V ]]; then
-            TAG="v${TAG:1}"
-          fi
+          # Convert V1 / V1.2 / V1.2.3 -> v1 / v1.2 / v1.2.3
+          TAG="${TAG/#V/v}"
 
-          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          # Remove leading v for parsing
+          VERSION="${TAG#v}"
+
+          # Accept:
+          # v1
+          # v1.0
+          # v1.0.0
+          if [[ ! "$VERSION" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then
             echo "::error::Invalid version: $TAG"
-            echo "Example: v1.0.0"
+            echo "Accepted examples:"
+            echo "  v1"
+            echo "  v1.0"
+            echo "  v1.0.0"
             exit 1
           fi
 
-          echo "Release: $TAG"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+
+          MINOR="${MINOR:-0}"
+          PATCH="${PATCH:-0}"
+
+          TAG="v${MAJOR}.${MINOR}.${PATCH}"
+
+          echo "Release version: $TAG"
+
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      # --------------------------------------------------------
+      # Create tag only for manual workflow
+      # --------------------------------------------------------
 
       - name: Create tag
         if: github.event_name == 'workflow_dispatch'
         env:
           TAG: ${{ steps.version.outputs.tag }}
+        shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git tag "$TAG"
-          git push origin "$TAG"
+          # Check whether tag already exists
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists on remote."
+          else
+            echo "Creating tag $TAG"
+            git tag "$TAG"
+            git push origin "$TAG"
+          fi
+
+      # --------------------------------------------------------
+      # Create GitHub Release
+      # --------------------------------------------------------
 
       - name: Create GitHub Release
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
+        shell: bash
         run: |
-          gh release create "$TAG" \
-            --title "$TAG" \
-            --generate-notes
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release $TAG already exists."
+          else
+            echo "Creating release $TAG"
 
+            gh release create "$TAG" \
+              --repo "${{ github.repository }}" \
+              --title "Kadugu $TAG" \
+              --generate-notes
+          fi
+
+
+  # ============================================================
+  # BUILD
+  # ============================================================
 
   build:
     name: Build ${{ matrix.name }}
 
     needs: prepare-release
-
-    permissions:
-      contents: write
 
     strategy:
       fail-fast: false
@@ -90,32 +135,46 @@ jobs:
       matrix:
         include:
 
-          # Linux x64
+          # ----------------------------------------------------
+          # Linux x86_64
+          # ----------------------------------------------------
+
           - name: Linux x86_64
             target: x86_64-unknown-linux-gnu
             os: ubuntu-24.04
 
-          # Windows x64
+          # ----------------------------------------------------
+          # Windows x86_64
+          # ----------------------------------------------------
+
           - name: Windows x86_64
             target: x86_64-pc-windows-msvc
-            os: windows-latest
+            os: windows-2025
 
-          # Android ARM64 / Termux
+          # ----------------------------------------------------
+          # Android / Termux ARM64
+          # ----------------------------------------------------
+
           - name: Termux Android ARM64
             target: aarch64-linux-android
             os: ubuntu-24.04
+
 
     runs-on: ${{ matrix.os }}
 
     steps:
 
+      # ========================================================
+      # CHECKOUT
+      # ========================================================
+
       - name: Checkout
         uses: actions/checkout@v6
 
 
-      # ==========================================
-      # Rust
-      # ==========================================
+      # ========================================================
+      # RUST
+      # ========================================================
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -123,18 +182,18 @@ jobs:
           targets: ${{ matrix.target }}
 
 
-      # ==========================================
-      # Android / Termux ARM64
-      # ==========================================
+      # ========================================================
+      # ANDROID / TERMUX
+      # ========================================================
 
       - name: Install Android NDK
         if: matrix.target == 'aarch64-linux-android'
         shell: bash
         run: |
-          yes | sudo ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager \
+          yes | sudo "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" \
             --licenses || true
 
-          ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager \
+          "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" \
             "ndk;27.2.12479018"
 
 
@@ -157,76 +216,124 @@ jobs:
           echo "AR_aarch64_linux_android=$TOOLCHAIN/bin/llvm-ar" >> "$GITHUB_ENV"
 
 
-      # ==========================================
-      # Build
-      # ==========================================
+      # ========================================================
+      # BUILD
+      # ========================================================
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          cargo build \
+            --release \
+            --target "${{ matrix.target }}"
 
 
-      # ==========================================
-      # Package
-      # ==========================================
+      # ========================================================
+      # PACKAGE LINUX
+      # ========================================================
 
       - name: Package Linux
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         shell: bash
         run: |
           mkdir -p release
-          cp target/${{ matrix.target }}/release/kadugu release/kadugu-linux-x86_64
-          tar -czf kadugu-linux-x86_64.tar.gz -C release kadugu-linux-x86_64
 
+          cp \
+            "target/${{ matrix.target }}/release/kadugu" \
+            "release/kadugu-linux-x86_64"
+
+          tar -czf \
+            kadugu-linux-x86_64.tar.gz \
+            -C release \
+            kadugu-linux-x86_64
+
+
+      # ========================================================
+      # PACKAGE WINDOWS
+      # ========================================================
 
       - name: Package Windows
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force release
-          Copy-Item "target/${{ matrix.target }}/release/kadugu.exe" "release/kadugu-windows-x86_64.exe"
+
+          Copy-Item `
+            "target/${{ matrix.target }}/release/kadugu.exe" `
+            "release/kadugu-windows-x86_64.exe"
+
           Compress-Archive `
             -Path "release/kadugu-windows-x86_64.exe" `
-            -DestinationPath "kadugu-windows-x86_64.zip"
+            -DestinationPath "kadugu-windows-x86_64.zip" `
+            -Force
 
+
+      # ========================================================
+      # PACKAGE TERMUX
+      # ========================================================
 
       - name: Package Termux
         if: matrix.target == 'aarch64-linux-android'
         shell: bash
         run: |
           mkdir -p release
-          cp target/${{ matrix.target }}/release/kadugu release/kadugu-termux-arm64
-          tar -czf kadugu-termux-arm64.tar.gz -C release kadugu-termux-arm64
+
+          cp \
+            "target/${{ matrix.target }}/release/kadugu" \
+            "release/kadugu-termux-arm64"
+
+          tar -czf \
+            kadugu-termux-arm64.tar.gz \
+            -C release \
+            kadugu-termux-arm64
 
 
-      # ==========================================
-      # Upload to GitHub Release
-      # ==========================================
+      # ========================================================
+      # UPLOAD LINUX
+      # ========================================================
 
       - name: Upload Linux
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.prepare-release.outputs.tag }}
+        shell: bash
         run: |
           gh release upload "$TAG" \
-            kadugu-linux-x86_64.tar.gz
+            "kadugu-linux-x86_64.tar.gz" \
+            --repo "${{ github.repository }}" \
+            --clobber
 
+
+      # ========================================================
+      # UPLOAD WINDOWS
+      # ========================================================
 
       - name: Upload Windows
         if: matrix.target == 'x86_64-pc-windows-msvc'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.prepare-release.outputs.tag }}
+        shell: pwsh
         run: |
-          gh release upload "$TAG" \
-            kadugu-windows-x86_64.zip
+          gh release upload "$env:TAG" `
+            "kadugu-windows-x86_64.zip" `
+            --repo "${{ github.repository }}" `
+            --clobber
 
+
+      # ========================================================
+      # UPLOAD TERMUX
+      # ========================================================
 
       - name: Upload Termux
         if: matrix.target == 'aarch64-linux-android'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.prepare-release.outputs.tag }}
+        shell: bash
         run: |
           gh release upload "$TAG" \
-            kadugu-termux-arm64.tar.gz
+            "kadugu-termux-arm64.tar.gz" \
+            --repo "${{ github.repository }}" \
+            --clobber
