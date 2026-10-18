@@ -6,46 +6,125 @@ permissions:
 on:
   push:
     tags:
-      - v[0-9]+.*
+      - 'v[0-9]+.*'
+
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (example: v1.0.0)'
+        required: true
+        type: string
 
 jobs:
-  create-release:
+  prepare-release:
     runs-on: ubuntu-latest
+
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: taiki-e/create-gh-release-action@v1
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.version }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+.*$ ]]; then
+            echo "Invalid version: $TAG"
+            exit 1
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Create tag for manual release
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git tag "${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+
+      - name: Create GitHub Release
+        uses: taiki-e/create-gh-release-action@v1
         with:
-          # (optional) Path to changelog.
           changelog: CHANGELOG.md
-          # (required) GitHub token for creating GitHub Releases.
           token: ${{ secrets.GITHUB_TOKEN }}
 
-  upload-assets:
-    needs: create-release
+  build:
+    needs: prepare-release
+
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+
+          # Linux PC
+          - name: Linux x86_64
+            target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-          - target: x86_64-apple-darwin
+
+          # Android / Termux ARM64
+          - name: Termux Android ARM64
+            target: aarch64-linux-android
+            os: ubuntu-latest
+
+          # macOS Intel
+          - name: macOS x86_64
+            target: x86_64-apple-darwin
             os: macos-latest
-          - target: x86_64-pc-windows-msvc
+
+          # macOS Apple Silicon
+          - name: macOS ARM64
+            target: aarch64-apple-darwin
+            os: macos-latest
+
+          # Windows
+          - name: Windows x86_64
+            target: x86_64-pc-windows-msvc
             os: windows-latest
-          - target: aarch64-unknown-linux-gnu
-            os: raspberry-pi
+
     runs-on: ${{ matrix.os }}
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: taiki-e/upload-rust-binary-action@v1
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust target
+        if: matrix.target == 'aarch64-linux-android'
+        run: |
+          rustup target add aarch64-linux-android
+
+      - name: Install Android NDK
+        if: matrix.target == 'aarch64-linux-android'
+        run: |
+          yes | sudo ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager \
+            --licenses || true
+
+          ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager \
+            "ndk;27.2.12479018"
+
+      - name: Configure Android ARM64 linker
+        if: matrix.target == 'aarch64-linux-android'
+        run: |
+          NDK="${ANDROID_HOME}/ndk/27.2.12479018"
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
+
+          echo "PATH=$TOOLCHAIN/bin:$PATH" >> "$GITHUB_ENV"
+
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TOOLCHAIN/bin/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+
+          echo "CC_aarch64_linux_android=$TOOLCHAIN/bin/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+          echo "CXX_aarch64_linux_android=$TOOLCHAIN/bin/aarch64-linux-android24-clang++" >> "$GITHUB_ENV"
+          echo "AR_aarch64_linux_android=$TOOLCHAIN/bin/llvm-ar" >> "$GITHUB_ENV"
+
+      - name: Build and upload
+        uses: taiki-e/upload-rust-binary-action@v1
         with:
-          # (required) Comma-separated list of binary names (non-extension portion of filename) to build and upload.
-          # Note that glob pattern is not supported yet.
           bin: kadugu
-          # (optional) Target triple, default is host triple.
-          # This is optional but it is recommended that this always be set to
-          # clarify which target you are building for if macOS is included in
-          # the matrix because GitHub Actions changed the default architecture
-          # of macos-latest since macos-14.
           target: ${{ matrix.target }}
-          # (required) GitHub token for uploading assets to GitHub Releases.
           token: ${{ secrets.GITHUB_TOKEN }}
