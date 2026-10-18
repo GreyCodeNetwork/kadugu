@@ -17,14 +17,15 @@ on:
 
 jobs:
   prepare-release:
-    runs-on: ubuntu-latest
+    name: Prepare Release
+    runs-on: ubuntu-24.04
 
     outputs:
       tag: ${{ steps.version.outputs.tag }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Determine version
         id: version
@@ -36,95 +37,80 @@ jobs:
             TAG="${GITHUB_REF_NAME}"
           fi
 
-          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+.*$ ]]; then
-            echo "Invalid version: $TAG"
+          # Remove spaces
+          TAG="$(echo "$TAG" | xargs)"
+
+          # Convert V1.0.0 -> v1.0.0
+          if [[ "$TAG" =~ ^V ]]; then
+            TAG="v${TAG:1}"
+          fi
+
+          # Validate version
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "::error::Invalid version: $TAG"
+            echo "Use something like v1.0.0"
             exit 1
           fi
 
+          echo "Release tag: $TAG"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Create tag for manual release
+      - name: Create tag
         if: github.event_name == 'workflow_dispatch'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
         run: |
-          git tag "${{ steps.version.outputs.tag }}"
-          git push origin "${{ steps.version.outputs.tag }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git tag "$TAG"
+          git push origin "$TAG"
 
       - name: Create GitHub Release
-        uses: taiki-e/create-gh-release-action@v1
-        with:
-          changelog: CHANGELOG.md
-          token: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists"
+          else
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --generate-notes
+          fi
+
 
   build:
+    name: Build ${{ matrix.name }}
+
     needs: prepare-release
 
     strategy:
       fail-fast: false
+
       matrix:
         include:
 
-          # Linux PC
+          # ==========================================
+          # Linux x86_64
+          # ==========================================
           - name: Linux x86_64
             target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
 
-          # Android / Termux ARM64
+          # ==========================================
+          # Android ARM64 - TERMUX
+          # ==========================================
           - name: Termux Android ARM64
             target: aarch64-linux-android
-            os: ubuntu-latest
+            os: ubuntu-24.04
 
+          # ==========================================
           # macOS Intel
+          # ==========================================
           - name: macOS x86_64
             target: x86_64-apple-darwin
             os: macos-latest
 
-          # macOS Apple Silicon
-          - name: macOS ARM64
-            target: aarch64-apple-darwin
-            os: macos-latest
-
-          # Windows
-          - name: Windows x86_64
-            target: x86_64-pc-windows-msvc
-            os: windows-latest
-
-    runs-on: ${{ matrix.os }}
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust target
-        if: matrix.target == 'aarch64-linux-android'
-        run: |
-          rustup target add aarch64-linux-android
-
-      - name: Install Android NDK
-        if: matrix.target == 'aarch64-linux-android'
-        run: |
-          yes | sudo ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager \
-            --licenses || true
-
-          ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager \
-            "ndk;27.2.12479018"
-
-      - name: Configure Android ARM64 linker
-        if: matrix.target == 'aarch64-linux-android'
-        run: |
-          NDK="${ANDROID_HOME}/ndk/27.2.12479018"
-          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
-
-          echo "PATH=$TOOLCHAIN/bin:$PATH" >> "$GITHUB_ENV"
-
-          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TOOLCHAIN/bin/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
-
-          echo "CC_aarch64_linux_android=$TOOLCHAIN/bin/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
-          echo "CXX_aarch64_linux_android=$TOOLCHAIN/bin/aarch64-linux-android24-clang++" >> "$GITHUB_ENV"
-          echo "AR_aarch64_linux_android=$TOOLCHAIN/bin/llvm-ar" >> "$GITHUB_ENV"
-
-      - name: Build and upload
-        uses: taiki-e/upload-rust-binary-action@v1
-        with:
-          bin: kadugu
-          target: ${{ matrix.target }}
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # ==========================================
+          # mac
